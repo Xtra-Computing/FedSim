@@ -1,7 +1,8 @@
+# FedSim
+FedSim is a **coupled vertical federated learning framework** that boosts the training with record similarities.
 
 
-
-# Requirements
+## Requirements
 1. Install conda 4.14 following https://www.anaconda.com/products/distribution
 2. Clone this repo by
 ```bash
@@ -20,7 +21,7 @@ $ conda activate fedsim
 ```bash
 (fedsim) $ mkdir -p runs ckp log cache
 ```
-# Datasets
+## Datasets
 In this repo, due to the size limit, we include two datasets `house` and `game` in the `data/` folder.
 ```
 data
@@ -31,8 +32,9 @@ data
     ├── hdb_clean.csv		(Primary)
     └── school_clean.csv	(Secondary)
 ```
-# Run Scripts
-## FedSim without adding noise
+## Linkage and Training
+The linkage and training of each dataset is combined in a single script.
+### FedSim without adding noise
 The scripts without adding noise are located under `src/` in the format of `src/train_<dataset>_<algorithm>.py`. You can run each script by
 
 ```bash
@@ -51,10 +53,13 @@ $ python src/train_beijing_fedsim.py -g 1 -p 1e0 -k 5 -ds
 ```
 runs FedSim on house dataset with $\tau=1$ (no added noise), $K=5$, merging with CNN, disabling sort gate, enabling weight gate.
 
-## FedSim with noise added
+### FedSim with noise added
 The scripts with adding noise are located in `src/priv_scripts` in the same format as the scripts without noise. The only difference are some hyperparamter settings. You may run these scripts by similar command. For example,
 ```bash
 $ python src/train_beijing_fedsim.py -g 1 -p 1e-2 -k 5 -ds
 ```
-runs FedSim on house dataset with noise satisfying $\tau=1$ added, $K=5$, merging with CNN, disabling sort gate, enabling weight gate, 
+runs FedSim on house dataset with noise satisfying $\tau=1$ added, $K=5$, merging with CNN, disabling sort gate, enabling weight gate.
+
+## Citation
+> Wu, Zhaomin, Qinbin, Li, Bingsheng, He, "A Coupled Design of Exploiting Record Similarity for Practical Vertical Federated Learning." Accepted in _Advances in Neural information processing systems_ (2022).
 
