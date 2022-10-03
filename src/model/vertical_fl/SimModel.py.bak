@@ -1,0 +1,647 @@
+import os
+import abc
+import pickle
+import warnings
+import gc
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.neighbors import KDTree
+import joblib
+
+import torch
+from torch.utils.data import Dataset
+
+from tqdm import tqdm
+import deprecation
+import networkx as nx
+
+from .TwoPartyModel import TwoPartyBaseModel
+
+
+@deprecation.deprecated()
+def __remove_conflict_v1(matched_indices, n_batches: int):
+    """
+    Remove conflict based on equitable coloring
+    :param matched_indices:
+    :param n_batches:
+    :return:
+    """
+    # build conflict graph
+    print("Adding edges")
+    conflict_records = {}
+    conflict_edges = []
+    for a, b in tqdm(matched_indices):
+        a = int(a)
+        b = int(b)
+        if b in conflict_records:
+            # add conflicts to graph
+            conflict_nodes = conflict_records[b]
+            conflict_edges += [(a, v) for v in conflict_nodes]
+
+            # record new node
+            conflict_records[b].add(a)
+        else:
+            # no conflict
+            conflict_records[b] = {a}
+    print("Constructing conflict graph")
+    start_time = datetime.now()
+    G = nx.Graph()
+    G.add_edges_from(conflict_edges)
+    time_cost_sec = (datetime.now() - start_time).seconds
+    print("Done constructing, cost {} seconds".format(time_cost_sec))
+
+    max_degree = max(G.degree, key=lambda x: x[1])[1]
+    if max_degree > n_batches:
+        warnings.warn("Degree {} is higher than #colors {}, coloring might cost exponential time"
+                      .format(max_degree, n_batches))
+
+    # equitable color the graph
+    print("Coloring")
+    start_time = datetime.now()
+    a_colors = nx.equitable_color(G, n_batches)
+    time_cost_sec = (datetime.now() - start_time).seconds
+    print("Done coloring, cost {} seconds".format(time_cost_sec))
+
+    sorted_a_colors = list(sorted(a_colors.item(), key=lambda x: x[0]))
+    return sorted_a_colors
+
+
+def remove_conflict(matched_indices: np.ndarray, n_batches: int):
+    # group by idx of B
+    sorted_indices = np.sort(matched_indices, axis=1)
+
+    batched_indices = [[] for _ in n_batches]
+    cur_a_count = 0
+    cur_a = -1
+    cur_pos = 0
+    for idx1, idx2 in sorted_indices:
+        batched_indices[cur_pos].append([idx1, idx2])
+
+        if int(idx1) == int(cur_a):
+            cur_a_count += 1
+            if cur_a_count > n_batches:
+                assert False, "The degree of {} is larger than batch size {}".format(idx2, n_batches)
+        else:
+            cur_a = idx1
+            cur_a_count = 1
+
+        cur_pos = (cur_pos + 1) % n_batches
+
+    return batched_indices
+
+
+class SimDataset(Dataset):
+    @torch.no_grad()    # disable auto_grad in __init__
+    def __init__(self, data1, data2, labels, data_idx, batch_sizes=1, sim_dim=1):
+        # data1[:, 0] and data2[:, 0] are both sim_scores
+        assert data1.shape[0] == data2.shape[0] == data_idx.shape[0]
+        # remove similarity scores in data1 (at column 0)
+        data1_labels = np.concatenate([data1[:, sim_dim:], labels.reshape(-1, 1)], axis=1)
+
+        print("Grouping data")
+        grouped_data1 = {}
+        grouped_data2 = {}
+        for i in range(data_idx.shape[0]):
+            idx1, idx2 = data_idx[i]
+            new_data2 = np.concatenate([idx2.reshape(1, 1), data2[i].reshape(1, -1)], axis=1)
+            if idx1 in grouped_data2:
+                grouped_data2[idx1] = np.concatenate([grouped_data2[idx1], new_data2], axis=0)
+            else:
+                grouped_data2[idx1] = new_data2
+            np.random.shuffle(grouped_data2[idx1])  # shuffle to avoid information leakage of the order
+            grouped_data1[idx1] = data1_labels[i]
+        print("Done")
+
+        print("Checking if B is sorted by similarity: ", end="")
+        is_sorted = True
+        for k, v in grouped_data2.items():
+            is_sorted = is_sorted and np.all(np.diff(v[:, 1].flatten()) < 0)
+        print(is_sorted)
+
+        group1_data_idx = np.array(list(grouped_data1.keys()))
+        group1_data1_labels = np.array(list(grouped_data1.values()))
+        group2_data_idx = np.array(list(grouped_data2.keys()))
+        group2_data2 = np.array(list(grouped_data2.values()), dtype='object')
+
+        # print("Equitable coloring to remove conflict")
+        # data1_colors = remove_conflict(data_idx, n_batches=np.ceil(data1.shape[0] / batch_sizes).astype('int'))
+        # data1_order = np.argsort(data1_colors, axis=1)
+
+        print("Sorting data")
+        group1_order = group1_data_idx.argsort()
+        group2_order = group2_data_idx.argsort()
+
+        group1_data_idx = group1_data_idx[group1_order]
+        group1_data1_labels = group1_data1_labels[group1_order]
+        group2_data_idx = group2_data_idx[group2_order]
+        group2_data2 = group2_data2[group2_order]
+        assert (group1_data_idx == group2_data_idx).all()
+        print("Done")
+
+        data1_idx: np.ndarray = group1_data_idx
+        data1: np.ndarray = group1_data1_labels[:, :-1]
+        self.labels: torch.Tensor = torch.from_numpy(group1_data1_labels[:, -1])
+        data2: list = group2_data2
+
+        print("Retrieve data")
+        data_list = []
+        weight_list = []
+        data_idx_list = []
+        # self.data_idx_split_points = [0]
+        for i in range(data1_idx.shape[0]):
+            d2 = torch.from_numpy(data2[i].astype(np.float)[:, 1:])  # remove index
+            d2_idx = data2[i].astype(np.float)[:, 0].reshape(-1, 1)
+            d1 = torch.from_numpy(np.repeat(data1[i].reshape(1, -1), d2.shape[0], axis=0))
+            d = torch.cat([d2[:, :sim_dim], d1, d2[:, sim_dim:]], dim=1)  # move similarity to index 0
+            data_list.append(d)
+
+            weight = torch.ones(d2.shape[0]) / d2.shape[0]
+            weight_list.append(weight)
+
+            d1_idx = np.repeat(data1_idx[i].item(), d2.shape[0], axis=0).reshape(-1, 1)
+            idx = torch.from_numpy(np.concatenate([d1_idx, d2_idx], axis=1))
+            data_idx_list.append(idx)
+            # self.data_idx_split_points.append(self.data_idx_split_points[-1] + idx.shape[0])
+        print("Done")
+
+        self.data = torch.cat(data_list, dim=0)  # sim_scores; data1; data2
+        self.weights = torch.cat(weight_list, dim=0)
+        data_idx = torch.cat(data_idx_list, dim=0)
+
+        print("Sort to remove conflicts")
+        n_batches = np.ceil(data1.shape[0] / batch_sizes).astype('int')
+        batched_indices = remove_conflict(data_idx.detach().cpu().numpy(), n_batches)
+        self.data_idx_split_points = np.cumsum([0] + [len(b) for b in batched_indices])
+        self.data_idx = torch.from_numpy(np.concatenate(batched_indices))
+
+    def __len__(self):
+        return self.data_idx.shape[0]
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        start = self.data_idx_split_points[idx]
+        end = self.data_idx_split_points[idx + 1]
+
+        return self.data[start:end], self.labels[idx], self.weights[start:end], \
+               self.data_idx[start:end]
+
+
+class SimModel(TwoPartyBaseModel):
+    def __init__(self, num_common_features, n_clusters=100, center_threshold=0.5,
+                 blocking_method='grid', feature_wise_sim=False,
+                 # Split Learning
+                 local_hidden_sizes=None, agg_hidden_sizes=None, cut_dims=None,
+                 **kwargs):
+        super().__init__(num_common_features, **kwargs)
+
+        self.feature_wise_sim = feature_wise_sim
+        self.blocking_method = blocking_method
+        self.center_threshold = center_threshold
+        self.n_clusters = n_clusters
+
+        if local_hidden_sizes is None:
+            self.local_hidden_sizes = [[10], [10]]
+        else:
+            self.local_hidden_sizes = local_hidden_sizes
+
+        if cut_dims is None:
+            self.cut_dims = [100, 10]
+        else:
+            self.cut_dims = cut_dims
+
+        if agg_hidden_sizes is None:
+            self.merge_hidden_sizes = [10]
+        else:
+            self.merge_hidden_sizes = agg_hidden_sizes
+
+    def merge_pred(self, pred_all: list):
+        sort_pred_all = list(sorted(pred_all, key=lambda t: t[0], reverse=True))
+        return sort_pred_all[0][0]
+
+    @staticmethod
+    def _collect(array):
+        """
+        Obtained from
+        https://stackoverflow.com/questions/30003068/how-to-get-a-list-of-all-indices-of-repeated-elements-in-a-numpy-array
+        :param array:
+        :return: <Values of unique elements>, <
+        """
+        idx_sort = np.argsort(array)
+        sorted_array = array[idx_sort]
+
+        # returns the unique values, the index of the first occurrence of a value, and the count for each element
+        vals, idx_start, count = np.unique(sorted_array, return_counts=True, return_index=True)
+
+        # splits the indices into separate arrays
+        res = np.split(idx_sort, idx_start[1:])
+
+        return vals, res
+
+    @deprecation.deprecated()
+    def __cal_sim_score_kmeans(self, key1, key2, seed=0):
+        """
+        Deprecated
+        :return: numpy array with size (n, 3), table of similarity scores
+                 ['index_data1': int, 'index_data2': int, 'sim_score': float]
+        """
+
+        # clustering
+        print("Clustering")
+        kmeans1 = MiniBatchKMeans(n_clusters=self.n_clusters, random_state=seed).fit(key1)
+        kmeans2 = MiniBatchKMeans(n_clusters=self.n_clusters, random_state=seed).fit(key2)
+
+        # filter close cluster centers
+        print("Filter close cluster centers")
+        close_clusters = []
+        for i, center1 in enumerate(kmeans1.cluster_centers_):
+            for j, center2 in enumerate(kmeans2.cluster_centers_):
+                if np.linalg.norm(center1 - center2) < self.center_threshold:
+                    close_clusters.append((i, j))
+        print("Got {} close clusters after filtering".format(len(close_clusters)))
+
+        labels1, indices1 = self._collect(kmeans1.labels_)
+        labels2, indices2 = self._collect(kmeans2.labels_)
+
+        # compare within the block
+        print("Compare within each cluster")
+        sim_scores = []
+        for (label1, label2) in close_clusters:
+            idx1 = indices1[np.argwhere(labels1 == label1).item()]
+            idx2 = indices2[np.argwhere(labels2 == label2).item()]
+            for i in idx1:
+                for j in idx2:
+                    if self.feature_wise_sim:
+                        score = -(key1[i] - key2[j]) ** 2
+                    else:
+                        score = -np.linalg.norm(key1[i] - key2[j])  # reverse distance
+                    sim_scores.append(np.concatenate([np.array([i, j]), np.array(score)], axis=0))
+        print("Done calculating similarity scores")
+
+        # scale similarity scores to [0, 1]
+        sim_scores = np.stack(sim_scores)
+        if self.sim_scaler is not None:
+            sim_scores[:, 2:] = self.sim_scaler.transform(sim_scores[:, 2:])
+        else:
+            self.sim_scaler = MinMaxScaler(feature_range=(0, 1))
+            sim_scores[:, 2:] = self.sim_scaler.fit_transform(sim_scores[:, 2:])
+        print("Done scaling")
+
+        return np.array(sim_scores)
+
+    def _array2base(self, array, base):
+        res = 0
+        for i, num in enumerate(array[::-1]):
+            res += num * base ** i
+        return res
+
+    def cal_sim_score_grid(self, key1, key2, grid_min=-3., grid_max=3.01, grid_width=0.2):
+        """
+        :param key1: Common features in party 1
+        :param key2: Common features in party 2
+        :param grid_min: min value of grid
+        :param grid_max: min value of grid
+        :param grid_width: width of grid
+        :return: sim_scores: Nx3 np.ndarray (idx_key1, idx_key2, sim_score)
+        """
+        print("Quantization")
+        bins = np.arange(grid_min, grid_max, grid_width)
+        quantized_key1 = np.digitize(key1, bins)
+        quantized_key2 = np.digitize(key2, bins)
+        quantized_key1 = np.array([self._array2base(k, bins.shape[0] + 1) for k in quantized_key1])
+        quantized_key2 = np.array([self._array2base(k, bins.shape[0] + 1) for k in quantized_key2])
+
+        print("Collect unique values")
+        grid_ids1, indices1 = self._collect(quantized_key1)
+        grid_ids2, indices2 = self._collect(quantized_key2)
+
+        blocks = np.intersect1d(quantized_key1, quantized_key2)
+        print("Finished quantization, got {} blocks".format(blocks.shape[0]))
+
+        # compare within the block
+        print("Compare within each block")
+        sim_scores = []
+        for quantized_id in tqdm(blocks):
+            idx1 = indices1[np.argwhere(grid_ids1 == quantized_id).item()]
+            idx2 = indices2[np.argwhere(grid_ids2 == quantized_id).item()]
+            for i in idx1:
+                for j in idx2:
+                    if self.feature_wise_sim:
+                        score = -(key1[i] - key2[j]) ** 2
+                    else:
+                        score = -np.linalg.norm(key1[i] - key2[j]).reshape(-1)  # reverse distance
+                    sim_scores.append(np.concatenate([np.array([i, j]), np.array(score)], axis=0))
+        print("Done calculating similarity scores")
+
+        # scale similarity scores to [0, 1]
+        sim_scores = np.stack(sim_scores)
+        if self.sim_scaler is not None:
+            sim_scores[:, 2:] = self.sim_scaler.transform(sim_scores[:, 2:])
+        else:
+            self.sim_scaler = MinMaxScaler(feature_range=(0, 1))
+            sim_scores[:, 2:] = self.sim_scaler.fit_transform(sim_scores[:, 2:])
+        print("Done scaling")
+
+        return sim_scores
+
+    def cal_sim_score_knn(self, key1, key2, knn_k=3, tree_leaf_size=40):
+        """
+        :param tree_leaf_size: leaf size to build kd-tree
+        :param knn_k: number of nearest neighbors to be calculated
+        :param radius: only the distance with radius will be returned
+        :param key1: Common features in party 1
+        :param key2: Common features in party 2
+        :return: sim_scores: Nx3 np.ndarray (idx_key1, idx_key2, sim_score)
+        """
+        print("Build KD-tree")
+        tree = KDTree(key2, leaf_size=tree_leaf_size)
+
+        print("Query KD-tree")
+        # sort_results should be marked False to avoid the order leaking information
+        dists, idx2 = tree.query(key1, k=knn_k, return_distance=True, sort_results=False)
+
+        repeat_times = [x.shape[0] for x in idx2]
+        non_empty_idx = [x > 0 for x in repeat_times]
+        idx1 = np.repeat(np.arange(key1.shape[0]), repeat_times)
+        idx2 = np.concatenate(idx2[np.array(repeat_times) > 0])
+
+        print("Calculate sim_scores")
+        idx1 = np.repeat(np.arange(key1.shape[0]), knn_k)
+        if self.feature_wise_sim:
+            sims = -(key1[idx1] - key2[idx2]) ** 2
+            sim_scores = np.concatenate([idx1.reshape(-1, 1), idx2.reshape(-1, 1), sims], axis=1)
+        else:
+            sim_scores = np.vstack([idx1, idx2.flatten(), -dists.flatten()]).T
+
+        if self.sim_scaler is not None:
+            # use train scaler
+            sim_scores[:, 2:] = self.sim_scaler.transform(sim_scores[:, 2:])
+        else:
+            # generate train scaler
+            self.sim_scaler = MinMaxScaler(feature_range=(0, 1))
+            sim_scores[:, 2:] = self.sim_scaler.fit_transform(sim_scores[:, 2:])
+        print("Done scaling")
+
+        return sim_scores
+
+    def cal_sim_score_radius(self, key1, key2, radius=3, tree_leaf_size=40):
+        """
+        :param tree_leaf_size: leaf size to build kd-tree
+        :param radius: only the distance with radius will be returned
+        :param key1: Common features in party 1
+        :param key2: Common features in party 2
+        :return: sim_scores: Nx3 np.ndarray (idx_key1, idx_key2, sim_score)
+        """
+        print("Build KD-tree")
+        tree = KDTree(key2, leaf_size=tree_leaf_size)
+
+        print("Query KD-tree")
+        idx2, dists = tree.query_radius(key1, r=radius, return_distance=True, sort_results=False)
+
+        print("Calculate sim_scores")
+        repeat_times = [x.shape[0] for x in idx2]
+        non_empty_idx = [x > 0 for x in repeat_times]
+        idx1 = np.repeat(np.arange(key1.shape[0]), repeat_times)
+        idx2 = np.concatenate(idx2[np.array(repeat_times) > 0])
+        if self.feature_wise_sim:
+            sims = -(key1[idx1] - key2[idx2]) ** 2
+        else:
+            sims = -np.concatenate(dists[np.array(repeat_times) > 0]).reshape(-1, 1)
+        # assert np.isclose(sims, -np.sqrt(np.sum((key1[idx1] - key2[idx2]) ** 2, axis=1)))
+        sim_scores = np.concatenate([idx1.reshape(-1, 1), idx2.reshape(-1, 1), sims], axis=1)
+        if self.sim_scaler is not None:
+            sim_scores[:, 2:] = self.sim_scaler.transform(sim_scores[:, 2:])
+        else:
+            self.sim_scaler = MinMaxScaler(feature_range=(0, 1))
+            sim_scores[:, 2:] = self.sim_scaler.fit_transform(sim_scores[:, 2:])
+        print("Done scaling")
+
+        return sim_scores
+
+    def match(self, data1, data2, labels, idx=None, preserve_key=False, sim_threshold=0.0, grid_min=-3., grid_max=3.01,
+              grid_width=0.2, knn_k=3, tree_leaf_size=40, radius=0.1):
+        """
+        Match data1 and data2 according to common features
+        :param radius:
+        :param knn_k:
+        :param tree_leaf_size:
+        :param blocking_method: method of blocking before matching
+        :param knn_k: number of nearest neighbors to be calculated
+        :param tree_leaf_size: leaf size to build kd-tree
+        :param idx: Index of training data1, not involved in linkage
+        :param sim_threshold: sim_threshold: threshold of similarity score.
+               Everything below the threshold will be removed
+        :param data1: [<other features in party 1>, common_features]
+        :param data2: [common_features, <other features in party 2>]
+        :param labels: corresponding labels
+        :param preserve_key:
+        :return: [data1, data2], labels
+                 data1 = [sim_score, <other features in party 1>]
+                 data2 = [sim_score, <other features in party 2>]
+        """
+        # extract common features from data
+        key1 = data1[:, -self.num_common_features:]
+        key2 = data2[:, :self.num_common_features]
+
+        # calculate similarity scores
+        if self.blocking_method == 'grid':
+            sim_scores = self.cal_sim_score_grid(key1, key2, grid_min=grid_min, grid_max=grid_max,
+                                                 grid_width=grid_width)
+        elif self.blocking_method == 'knn':
+            sim_scores = self.cal_sim_score_knn(key1, key2, knn_k=knn_k, tree_leaf_size=tree_leaf_size)
+        elif self.blocking_method == 'radius':
+            sim_scores = self.cal_sim_score_radius(key1, key2, radius=radius, tree_leaf_size=tree_leaf_size)
+        else:
+            assert False, "Unsupported blocking method"
+
+        if preserve_key:
+            remain_data1 = data1
+            remain_data2 = data2
+        else:
+            remain_data1 = data1[:, :-self.num_common_features]
+            remain_data2 = data2[:, self.num_common_features:]
+
+        # real_sim_scores = []
+        # for idx1, idx2, score in sim_scores:
+        #     real_sim_scores.append([idx[int(idx1)], int(idx2), score])
+        # real_sim_scores = np.array(real_sim_scores)
+        real_sim_scores = np.concatenate([idx[sim_scores[:, 0].astype(np.int)].reshape(-1, 1),
+                                          sim_scores[:, 1:]], axis=1)
+
+        # # filter similarity scores (last column) by a threshold
+        # if not self.feature_wise_sim:
+        #     real_sim_scores = real_sim_scores[real_sim_scores[:, -1] >= sim_threshold]
+        # elif not np.isclose(sim_threshold, 0.0):
+        #     warnings.warn("Threshold is not used for feature-wise similarity")
+
+        # save sim scores
+        with open("cache/sim_scores.pkl", "wb") as f:
+            pickle.dump(real_sim_scores, f)
+
+        remain_data1_shape1 = remain_data1.shape[1]
+
+        # convert to pandas
+        data1_df = pd.DataFrame(remain_data1)
+        data1_df['data1_idx'] = idx
+        labels_df = pd.DataFrame(labels, columns=['y'])
+        data2_df = pd.DataFrame(remain_data2)
+        if self.feature_wise_sim:
+            score_columns = ['score' + str(i) for i in range(self.num_common_features)]
+        else:
+            score_columns = ['score']
+        sim_scores_df = pd.DataFrame(real_sim_scores, columns=['data1_idx', 'data2_idx'] + score_columns)
+        sim_scores_df[['data1_idx', 'data2_idx']].astype('int32')
+        data1_labels_df = pd.concat([data1_df, labels_df], axis=1)
+
+        matched_pairs = np.unique(sim_scores_df['data1_idx'].to_numpy())
+        print("Got {} samples in A".format(matched_pairs.shape[0]))
+
+        del remain_data1, remain_data2, labels, matched_pairs
+        gc.collect()
+
+        print("Setting index")
+        data1_labels_df.set_index('data1_idx', inplace=True)
+        data2_df['data2_idx'] = range(len(data2_df.index))
+        data2_df.set_index('data2_idx', inplace=True)
+        # sim_scores_df.set_index(['data1_idx', 'data2_idx'], inplace=True)
+
+        print("Linking records")
+        data1_labels_scores_df = sim_scores_df.merge(data1_labels_df, how='right', on='data1_idx')
+        print("Step 1 done.")
+        del data1_labels_df, sim_scores_df
+        gc.collect()
+        merged_data_labels_df = data1_labels_scores_df.merge(data2_df, how='left', left_on='data2_idx',
+                                                             right_index=True)
+        print("Finished Linking, got {} samples".format(len(merged_data_labels_df.index)))
+        del data2_df
+        gc.collect()
+
+        print("Filling null values")
+        merged_data_labels_df.fillna({col: 0.0 for col in score_columns}, inplace=True)
+
+        print("extracting data to numpy arrays")
+        ordered_labels = merged_data_labels_df['y'].to_numpy()
+        data1_indices = merged_data_labels_df['data1_idx'].to_numpy()
+        data2_indices = merged_data_labels_df['data2_idx'].to_numpy()
+        data_indices = np.vstack([data1_indices, data2_indices]).T
+        merged_data_labels_df.drop(['y', 'data1_idx', 'data2_idx'], axis=1, inplace=True)
+        merged_data_labels = merged_data_labels_df.to_numpy()
+        del merged_data_labels_df
+        gc.collect()
+        # merged_data_labels: |sim_scores|data1|data2|
+        sim_dim = self.num_common_features if self.feature_wise_sim else 1
+        matched_data1 = merged_data_labels[:, :sim_dim + remain_data1_shape1]
+        matched_data2 = np.concatenate([merged_data_labels[:, :sim_dim],  # sim scores
+                                        merged_data_labels[:, sim_dim + remain_data1_shape1:]],
+                                       axis=1)
+        # matched_data2 = merged_data_labels[:, sim_dim + remain_data1_shape1:]
+
+        return [matched_data1, matched_data2], ordered_labels, data_indices
+
+    def prepare_train_combine(self, data1, data2, labels, data_cache_path=None, scale=False):
+        if data_cache_path and os.path.isfile(data_cache_path):
+            print("Loading data from cache")
+            with open(data_cache_path, 'rb') as f:
+                train_dataset, val_dataset, test_dataset, y_scaler = pickle.load(f)
+            print("Done")
+        else:
+            print("Splitting data")
+            train_data1, val_data1, test_data1, train_labels, val_labels, test_labels, train_idx1, val_idx1, test_idx1 = \
+                self.split_data(data1, labels, val_rate=self.val_rate, test_rate=self.test_rate)
+
+            if self.dataset_type == 'syn':
+                train_data2 = data2[train_idx1]
+                val_data2 = data2[val_idx1]
+                test_data2 = data2[test_idx1]
+            elif self.dataset_type == 'real':
+                train_data2 = data2
+                val_data2 = data2
+                test_data2 = data2
+            else:
+                assert False, "Not supported dataset type"
+            print("Matching training set")
+            self.sim_scaler = None  # scaler will fit train_Xs and transform val_Xs, test_Xs
+            preserve_key = not self.drop_key
+            train_Xs, train_y, train_idx = self.match(train_data1, train_data2, train_labels, idx=train_idx1,
+                                                      preserve_key=preserve_key, grid_min=self.grid_min,
+                                                      grid_max=self.grid_max, grid_width=self.grid_width,
+                                                      knn_k=self.knn_k, tree_leaf_size=self.tree_leaf_size,
+                                                      radius=self.kd_tree_radius)
+            assert self.sim_scaler is not None
+            print("Matching validation set")
+            val_Xs, val_y, val_idx = self.match(val_data1, val_data2, val_labels, idx=val_idx1,
+                                                preserve_key=preserve_key, grid_min=self.grid_min,
+                                                grid_max=self.grid_max, grid_width=self.grid_width, knn_k=self.knn_k,
+                                                tree_leaf_size=self.tree_leaf_size, radius=self.kd_tree_radius)
+            assert self.sim_scaler is not None
+            print("Matching test set")
+            test_Xs, test_y, test_idx = self.match(test_data1, test_data2, test_labels, idx=test_idx1,
+                                                   preserve_key=preserve_key, grid_min=self.grid_min,
+                                                   grid_max=self.grid_max, grid_width=self.grid_width, knn_k=self.knn_k,
+                                                   tree_leaf_size=self.tree_leaf_size, radius=self.kd_tree_radius)
+
+            # debug
+
+            for train_X, val_X, test_X in zip(train_Xs, val_Xs, test_Xs):
+                print("Replace NaN with mean value")
+                col_mean = np.nanmean(train_X, axis=0)
+                train_indices = np.where(np.isnan(train_X))
+                train_X[train_indices] = np.take(col_mean, train_indices[1])
+                print("Train done.")
+                val_indices = np.where(np.isnan(val_X))
+                val_X[val_indices] = np.take(col_mean, val_indices[1])
+                print("Validation done.")
+                test_indices = np.where(np.isnan(test_X))
+                test_X[test_indices] = np.take(col_mean, test_indices[1])
+                print("Test done.")
+
+                if scale:
+                    sim_dim = self.num_common_features if self.feature_wise_sim else 1
+                    print("Scaling X")
+                    x_scaler = StandardScaler()
+                    train_X[:, sim_dim:] = x_scaler.fit_transform(train_X[:, sim_dim:])
+                    val_X[:, sim_dim:] = x_scaler.transform(val_X[:, sim_dim:])
+                    test_X[:, sim_dim:] = x_scaler.transform(test_X[:, sim_dim:])
+                    # train_X[:] = x_scaler.fit_transform(train_X)
+                    # val_X[:] = x_scaler.transform(val_X)
+                    # test_X[:] = x_scaler.transform(test_X)
+                    print("Scale done.")
+
+            y_scaler = None
+            if scale:
+                print("Scaling y")
+                y_scaler = MinMaxScaler(feature_range=(0, 1))
+                train_y = y_scaler.fit_transform(train_y.reshape(-1, 1)).flatten()
+                val_y = y_scaler.transform(val_y.reshape(-1, 1)).flatten()
+                test_y = y_scaler.transform(test_y.reshape(-1, 1)).flatten()
+                print("Scale done")
+
+            sim_dim = self.num_common_features if self.feature_wise_sim else 1
+            train_dataset = SimDataset(train_Xs[0], train_Xs[1], train_y, train_idx, sim_dim=sim_dim,
+                                       batch_sizes=self.train_batch_size)
+            val_dataset = SimDataset(val_Xs[0], val_Xs[1], val_y, val_idx, sim_dim=sim_dim,
+                                     batch_sizes=self.test_batch_size)
+            test_dataset = SimDataset(test_Xs[0], test_Xs[1], test_y, test_idx, sim_dim=sim_dim,
+                                      batch_sizes=self.test_batch_size)
+
+            if data_cache_path:
+                print("Saving data to cache")
+                with open(data_cache_path, 'wb') as f:
+                    pickle.dump([train_dataset, val_dataset, test_dataset, y_scaler], f)
+                print("Saved")
+
+        return train_dataset, val_dataset, test_dataset, y_scaler
+
+    @staticmethod
+    def var_collate_fn(batch):
+        data = torch.cat([item[0] for item in batch], dim=0)
+        labels = torch.stack([item[1] for item in batch])
+        weights = torch.cat([item[2] for item in batch], dim=0)
+        idx = torch.cat([item[3] for item in batch], dim=0)
+        # idx_unique = np.array([item[4] for item in batch], dtype=np.int)
+        return data, labels, weights, idx

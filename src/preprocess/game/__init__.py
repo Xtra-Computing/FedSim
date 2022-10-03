@@ -1,0 +1,1 @@
+from .game_loader import load_rawg, load_both, load_steam
