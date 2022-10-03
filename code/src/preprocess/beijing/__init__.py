@@ -1,1 +1,0 @@
-from .beijing_loder import *
