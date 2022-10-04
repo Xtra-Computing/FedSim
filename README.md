@@ -58,7 +58,7 @@ The scripts with adding noise are located in `src/priv_scripts` in the same form
 ```bash
 python src/train_beijing_fedsim.py -g 1 -p 1e-2 -k 5 -ds
 ```
-runs FedSim on house dataset with noise satisfying $\tau=1$ added, $K=5$, merging with CNN, disabling sort gate, enabling weight gate.
+runs FedSim on house dataset with noise satisfying $\tau=0.01$ added, $K=5$, merging with CNN, disabling sort gate, enabling weight gate.
 
 ## Citation
 > Wu, Zhaomin, Qinbin, Li, Bingsheng, He, "A Coupled Design of Exploiting Record Similarity for Practical Vertical Federated Learning." Accepted in _Advances in Neural information processing systems_ (2022).
