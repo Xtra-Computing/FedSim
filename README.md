@@ -1,4 +1,6 @@
 # FedSim
+[![GitHub license](https://img.shields.io/github/license/Xtra-Computing/FedSim)](https://github.com/Xtra-Computing/FedSim/edit/main/LICENSE)
+
 FedSim is a **coupled vertical federated learning framework** that boosts the training with record similarities.
 
 
