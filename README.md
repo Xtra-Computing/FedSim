@@ -42,15 +42,15 @@ The linkage and training of each dataset is combined in a single script.
 ### FedSim without adding noise
 The scripts without adding noise are located under `src/` in the format of `src/train_<dataset>_<algorithm>.py`. You can run each script by
 
-```bash
-python src/train_<dataset>_<algorithm>.py [-g gpu_index] [-p perturbed_noise_on_similarity] [-k number_of_neighbors] [--mlp-merge] [-ds] [-dw]
-```
-> -g/--gpu: GPU index to run this script. If GPU of this index is not available, CPU will be used instead.
-> -k/--top-k: Number of neighbors to extract from possible matches, which should be less than the value of "knn_k". ($K$ in the paper)
-> -p/--leak-p: The probability of leakage of bloom filters. ($\tau$ in the paper)
-> --mlp-merge: whether to replace CNN merge model with MLP merge model
-> -ds/--disable-sort: whether to distable the sort gate
-> -dw/--disable-weight: whether to disable the weight gate
+
+> python src/train_<dataset>_<algorithm>.py [-g gpu_index] [-p perturbed_noise_on_similarity] [-k number_of_neighbors] [--mlp-merge] [-ds] [-dw]
+
+* `-g/--gpu`: GPU index to run this script. If GPU of this index is not available, CPU will be used instead.
+* `-k/--top-k`: Number of neighbors to extract from possible matches, which should be less than the value of "knn_k". ($K$ in the paper)
+* `-p/--leak-p`: The probability of leakage of bloom filters. ($\tau$ in the paper)
+* `--mlp-merge`: whether to replace CNN merge model with MLP merge model
+* `-ds/--disable-sort`: whether to distable the sort gate
+* `-dw/--disable-weight`: whether to disable the weight gate
 
 Taking house dataset dataset as an example:
 ```bash
