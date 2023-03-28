@@ -67,12 +67,17 @@ runs FedSim on house dataset with noise satisfying $\tau=0.01$ added, $K=5$, mer
 
 ## Citation
 ```bib
-@inproceedings{fedsim,
-  author={Wu, Zhaomin and Li, Qinbin and He, Bingsheng},
-  booktitle={Advances in neural information processing systems},
-  title={A Coupled Design of Exploiting Record Similarity for Practical Vertical Federated Learning},
-  year={2022}
-}.
+@inproceedings{NEURIPS2022_84b74416,
+ author = {Wu, Zhaomin and Li, Qinbin and He, Bingsheng},
+ booktitle = {Advances in Neural Information Processing Systems},
+ editor = {S. Koyejo and S. Mohamed and A. Agarwal and D. Belgrave and K. Cho and A. Oh},
+ pages = {21087--21100},
+ publisher = {Curran Associates, Inc.},
+ title = {A Coupled Design of Exploiting Record Similarity for Practical Vertical Federated Learning},
+ url = {https://proceedings.neurips.cc/paper_files/paper/2022/file/84b744165a0597360caad96b06e69313-Paper-Conference.pdf},
+ volume = {35},
+ year = {2022}
+}
 ```
 
 
